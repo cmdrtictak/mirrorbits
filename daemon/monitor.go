@@ -66,7 +66,7 @@ func (m *mirror) NeedHealthCheck() bool {
 }
 
 func (m *mirror) NeedSync() bool {
-	return time.Since(m.LastSync.Time) > time.Duration(GetConfig().ScanInterval)*time.Minute
+	return time.Since(m.LastSync.Time) > time.Duration(GetConfig().ScanCheckInterval)*time.Minute
 }
 
 func (m *mirror) IsScanning() bool {
@@ -146,144 +146,244 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	return errRedirect
 }
 
-// Main monitor loop
-func (m *monitor) MonitorLoop() {
-	m.wg.Add(1)
-	defer m.wg.Done()
+// Returns true if given string is within given array
+func elementExists(s []string, str string) bool {
+  for _, v := range s {
+    if v == str {
+      return true
+    }
+  }
+  return false
+}
 
-	mirrorUpdateEvent := m.cache.GetMirrorInvalidationEvent()
+// Get Current time in HH:MM
+func getCurrentTime() string {
+	nowtime := time.Now().Format("15:04")
+	return nowtime
+}
 
-	// Wait until the database is ready to be used
-	for {
-		r := m.redis.Get()
-		if r.Err() != nil {
-			if _, ok := r.Err().(database.NetReadyError); ok {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
+// Get times to sync at from Config File
+func getScantimesRepo() []string {
+	st := GetConfig().ScantimesRepo
+	return st
+}
+func getScantimesMirror() []string {
+	st := GetConfig().ScantimesMirror
+	return st
+}
+
+
+// Get Config Option of Whether to Disable Scanning at Specific Times
+func getDisableScanningRepo() bool {
+	disable := GetConfig().DisableScanAtConfiguredRepo
+	return disable
+}
+func getDisableScanningMirror() bool {
+	disable := GetConfig().DisableScanAtConfiguredMirror
+	return disable
+}
+
+// Get Config Option of Whether to Sync Mirrors and Repos once at Startup (currently required to Start Timers and Tick-Processes)
+func getSyncAtStartup() bool {
+	//ias := GetConfig().SyncAtStartup
+	//return ias
+	return true
+}
+
+func triggerSyncMirrorList(m *monitor) {
+	log.Info("Syncing Mirrors")
+	m.retry(func(i uint) error {
+	ids, err := m.mirrorsID()
+	if err != nil {
+		if i == 0 {
+			log.Errorf("%+v", errors.Wrap(err, "unable to retrieve the mirror list"))
 		}
-		break
+		return err
 	}
-
-	// Scan the local repository
-	m.retry(func(i uint) error {
-		err := m.scanRepository()
-		if err != nil {
-			if i == 0 {
-				log.Errorf("%+v", errors.Wrap(err, "unable to scan the local repository"))
-			}
-			return err
-		}
-		return nil
-	}, 1*time.Second)
-
-	// Synchronize the list of all known mirrors
-	m.retry(func(i uint) error {
-		ids, err := m.mirrorsID()
-		if err != nil {
-			if i == 0 {
-				log.Errorf("%+v", errors.Wrap(err, "unable to retrieve the mirror list"))
-			}
-			return err
-		}
-		err = m.syncMirrorList(ids...)
-		if err != nil {
-			if i == 0 {
+	err = m.syncMirrorList(ids...)
+	if err != nil {
+		if i == 0 {
 				log.Errorf("%+v", errors.Wrap(err, "unable to sync the list of mirrors"))
 			}
 			return err
 		}
-		return nil
+	return nil
 	}, 500*time.Millisecond)
+}
 
-	if utils.IsStopped(m.stop) {
-		return
-	}
+// Main monitor loop
+func (m *monitor) MonitorLoop() {
+	m.wg.Add(1)
+	defer m.wg.Done()
+	
+	// Whether to Sync the Mirrors once at start
+	// Currently Required to Start Timers and Tick-Processes
+	// thus, getSyncAtStartup() returns true 
+	syncAtStartup := getSyncAtStartup()  
+	
+	disableScanAtConfiguredRepo := getDisableScanningRepo()  // Disable Scan at Configured Times for Repository?
+	disableScanAtConfiguredMirror := getDisableScanningMirror()  // ..Mirror?
 
-	// Start the cluster manager
-	m.cluster.Start()
+	nowtime := getCurrentTime()  // Get Current Time in HH:MM - Don't Sync if current time not eq to configured times
+	lastscantime := nowtime  // Required to ensure that the Mirrors Won't be synced unnecessarily, set to nowtime to avoid scanning within the same minute as startup as an initial sync happens anyway
+	
+	// Get Times to Sync Repo at from Config
+	scantimesRepo := getScantimesRepo()  
+	log.Info("Repo Sync Times:", scantimesRepo)
+	scantimesMirror := getScantimesMirror()
+	log.Info("Mirror Sync Times:", scantimesMirror)
+		
+	
+	// Still necessary to allow backwards compatibility
+	mirrorUpdateEvent := m.cache.GetMirrorInvalidationEvent()
+	
 
-	// Start the health check routines
-	for i := 0; i < healthCheckThreads; i++ {
-		m.wg.Add(1)
-		go m.healthCheckLoop()
-	}
-
-	// Start the mirror sync routines
-	for i := 0; i < GetConfig().ConcurrentSync; i++ {
-		m.wg.Add(1)
-		go m.syncLoop()
-	}
-
-	// Setup recurrent tasks
-	var repositoryScanTicker <-chan time.Time
-	repositoryScanInterval := -1
-	mirrorCheckTicker := time.NewTicker(1 * time.Second)
-
-	// Disable the mirror check while stopping to avoid spurious events
-	go func() {
-		select {
-		case <-m.stop:
-			mirrorCheckTicker.Stop()
-		}
-	}()
-
-	// Force a first configuration reload to setup the timers
-	select {
-	case m.configNotifier <- true:
-	default:
-	}
-
-	for {
-		select {
-		case <-m.stop:
-			return
-		case v := <-mirrorUpdateEvent:
-			id, err := strconv.Atoi(v)
-			if err == nil {
-				m.syncMirrorList(id)
-			}
-		case <-m.configNotifier:
-			if repositoryScanInterval != GetConfig().RepositoryScanInterval {
-				repositoryScanInterval = GetConfig().RepositoryScanInterval
-
-				if repositoryScanInterval == 0 {
-					repositoryScanTicker = nil
-				} else {
-					repositoryScanTicker = time.Tick(time.Duration(repositoryScanInterval) * time.Minute)
-				}
-			}
-		case <-repositoryScanTicker:
-			m.scanRepository()
-		case <-mirrorCheckTicker.C:
-			if m.redis.Failure() {
-				continue
-			}
-			m.mapLock.Lock()
-			for id, v := range m.mirrors {
-				if !v.Enabled {
-					// Ignore disabled mirrors
+	if syncAtStartup {
+		
+		// Wait until the database is ready to be used
+		for {
+			r := m.redis.Get()
+			if r.Err() != nil {
+				if _, ok := r.Err().(database.NetReadyError); ok {
+					time.Sleep(100 * time.Millisecond)
 					continue
 				}
-				if v.NeedHealthCheck() && !v.IsChecking() && m.cluster.IsHandled(id) {
-					select {
-					case m.healthCheckChan <- id:
-						m.mirrors[id].checking = true
-					default:
-					}
+			}
+			break
+		}
+		
+		// Scan the local repository
+		m.retry(func(i uint) error {
+			err := m.scanRepository()
+			if err != nil {
+				if i == 0 {
+					log.Errorf("%+v", errors.Wrap(err, "unable to scan the local repository"))
 				}
-				if v.NeedSync() && !v.IsScanning() && m.cluster.IsHandled(id) {
-					select {
-					case m.syncChan <- id:
-						m.mirrors[id].scanning = true
-					default:
-					}
+				return err
+			}
+			return nil
+		}, 1*time.Second)
+		
+
+		// Synchronize the list of all known mirrors
+		triggerSyncMirrorList(m)
+
+		if utils.IsStopped(m.stop) {
+			return
+		}
+
+		// Start the cluster manager
+		m.cluster.Start()
+
+		// Start the health check routines
+		for i := 0; i < healthCheckThreads; i++ {
+			m.wg.Add(1)
+			go m.healthCheckLoop()
+		}
+
+		// Start the mirror sync routines
+		for i := 0; i < GetConfig().ConcurrentSync; i++ {
+			m.wg.Add(1)
+			go m.syncLoop()
+		}
+		
+		
+		// Set Up Recurring Tasks
+		// The Repo Scan is triggered at the configured frequency
+		//
+		// The Default Config (see config.go) as been modified to
+		// set said frequency to once/minute, note that the actual sync won't 
+		// be triggered outside of given times
+		
+		var repositoryScanTicker <-chan time.Time
+		repositoryScanInterval := -1
+		mirrorCheckTicker := time.NewTicker(1 * time.Second)
+				
+		// Disable the mirror check while stopping to avoid spurious events
+		go func() {
+			select {
+			case <-m.stop:
+				mirrorCheckTicker.Stop()
+			}
+		}()
+
+		// Force a first configuration reload to setup the timers
+		select {
+			case m.configNotifier <- true:
+			default:
+		}
+		
+		for {
+			nowtime = getCurrentTime() // Update current time
+			
+			// This is ugly but we cant use this condition in a select.
+			// Only Scan at configured times  (or disable this check)
+			// Also, don't Scan every Second for a minute straight.
+			// As this check is independent from the repositoryScanTicker
+			// and thus resides within the main loop, the sync would otherwise be triggered every second
+			// while a time is set.
+			if !disableScanAtConfiguredMirror {
+				if elementExists(scantimesMirror, nowtime) && lastscantime != nowtime { 
+					triggerSyncMirrorList(m)
+					lastscantime = nowtime	
 				}
 			}
-			m.mapLock.Unlock()
+			
+			select {
+			case <-m.stop:
+				return
+			case v:= <-mirrorUpdateEvent:  // Kept for Backwards compatibility
+				if disableScanAtConfiguredMirror {  // Only Trigger if above Sync wasn't triggered
+					id, err := strconv.Atoi(v)
+					if err == nil {
+						m.syncMirrorList(id)
+					}
+				}
+			case <-m.configNotifier:
+				if repositoryScanInterval != GetConfig().RepositoryScanInterval {
+					repositoryScanInterval = GetConfig().RepositoryScanInterval
+						if repositoryScanInterval == 0 {
+						repositoryScanTicker = nil
+					} else {
+						repositoryScanTicker = time.Tick(time.Duration(repositoryScanInterval) * time.Minute)
+					}
+				}
+			case <-repositoryScanTicker:
+				// Only Scan at configured times  (or disable this check)
+				if elementExists(scantimesRepo, nowtime) || disableScanAtConfiguredRepo {  
+					m.scanRepository()
+				}
+			case <-mirrorCheckTicker.C:
+				if m.redis.Failure() {
+					continue
+				}
+				m.mapLock.Lock()
+				for id, v := range m.mirrors {
+					if !v.Enabled {
+						// Ignore disabled mirrors
+						continue
+					}
+					if v.NeedHealthCheck() && !v.IsChecking() && m.cluster.IsHandled(id) {
+						select {
+						case m.healthCheckChan <- id:
+							m.mirrors[id].checking = true
+						default:
+						}
+					}
+					if v.NeedSync() && !v.IsScanning() && m.cluster.IsHandled(id) {
+						select {
+						case m.syncChan <- id:
+							m.mirrors[id].scanning = true
+						default:
+						}
+					}
+				}
+				m.mapLock.Unlock()
+			}
 		}
-	}
+	} 
 }
+
 
 // Returns a list of all mirrors ID
 func (m *monitor) mirrorsID() ([]int, error) {
@@ -400,7 +500,6 @@ func (m *monitor) syncLoop() {
 			var mir mirror
 			var mirrorPtr *mirror
 			var ok bool
-
 			m.mapLock.Lock()
 			if mirrorPtr, ok = m.mirrors[id]; !ok {
 				m.mapLock.Unlock()
@@ -408,7 +507,6 @@ func (m *monitor) syncLoop() {
 			}
 			mir = *mirrorPtr
 			m.mapLock.Unlock()
-
 			conn := m.redis.Get()
 			scanning, err := scan.IsScanning(conn, id)
 			if err != nil {
@@ -457,12 +555,11 @@ func (m *monitor) syncLoop() {
 				log.Warningf("%-30.30s Scan already in progress", mir.Name)
 				goto end
 			}
-
 			if err == nil && mir.Enabled == true && mir.Up == false {
 				m.healthCheckChan <- id
 			}
-
 		end:
+			
 			m.mapLock.Lock()
 			if mirrorPtr, ok = m.mirrors[id]; ok {
 				mirrorPtr.scanning = false
@@ -615,6 +712,7 @@ func (m *monitor) getRandomFile(id int) (file string, size int64, err error) {
 
 // Trigger a sync of the local repository
 func (m *monitor) scanRepository() error {
+	log.Info("Scanning Repository")
 	err := scan.ScanSource(m.redis, false, m.stop)
 	if err != nil {
 		log.Errorf("Scanning source failed: %s", err.Error())

@@ -5,10 +5,10 @@
 ###################
 
 ## Path to the local repository
-# Repository: /srv/repo
+Repository: ./srv
 
 ## Path to the templates (default autodetect)
-# Templates: /usr/share/mirrorbits/
+Templates: ./templates
 
 ## A local path or URL containing the JavaScript used by the templates.
 ## If this is not set (the default), the JavaScript will just be loaded
@@ -19,7 +19,7 @@
 # LogDir: /var/log/mirrorbits
 
 ## Path to the GeoIP2 mmdb databases
-GeoipDatabasePath: /usr/share/GeoIP/
+# GeoipDatabasePath: /usr/share/GeoIP/
 
 ## OutputMode can take on the three values:
 ##  - redirect: HTTP redirect to the destination file on the selected mirror
@@ -31,10 +31,10 @@ GeoipDatabasePath: /usr/share/GeoIP/
 # Gzip: false
 
 ## Host and port to listen on
-ListenAddress: :8080
+# ListenAddress: :8080
 
 ## Host and port to listen for the CLI RPC
-RPCListenAddress: localhost:3390
+# RPCListenAddress: localhost:3390
 
 ## Password for restricting access to the CLI (optional)
 # RPCPassword:
@@ -75,10 +75,7 @@ RPCListenAddress: localhost:3390
 ## sizes and checksums.
 ## This should, more or less, match the frequency where the local repo
 ## is updated.
-## The Default here is 1 Minute, which is when the daemon checks the current time to compare it to 
-## Times given in Scantimes.
-## Originally, this was set to 5.
-# RepositoryScanInterval: 1
+# RepositoryScanInterval: 5
 
 ## Enable or disable specific hashing algorithms
 # Hashes:
@@ -93,9 +90,8 @@ RPCListenAddress: localhost:3390
 ## Maximum number of concurrent mirror synchronization to do (rsync/ftp) 
 # ConcurrentSync: 5
 
-## Interval in minutes between mirror scan attempts, where the scan itself will only trigger if 
-## the current time coincides with a Value from ScantimesMirror
-# ScanInterval: 1
+## Interval in minutes between mirror scan
+# ScanInterval: 30
 
 ## Interval in minutes between mirrors HTTP health checks
 # CheckInterval: 1
@@ -132,14 +128,3 @@ RPCListenAddress: localhost:3390
 #     - URL: http://fallback2.mirror/repo/
 #       CountryCode: us
 #       ContinentCode: na
-
-## Times at which to Scan The Repositories
-# ScantimesRepo: ["12:00", "13:00"]
-
-## Times at which to Scan The Mirrors
-# ScantimesMirror: ["12:05", "13:05"]
-
-## Whether to disable Scanning at specific times and restore original behavior
-# DisableScanAtConfiguredRepo: false
-# DisableScanAtConfiguredMirror: false
-
